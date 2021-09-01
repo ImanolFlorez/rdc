@@ -1,0 +1,359 @@
+---
+title: "Ruta del Cacao" 
+subtitle: "Modelización: Modelo ficheros(1)"
+output: 
+    html_document: 
+      code_download: true 
+      number_sections: yes
+      code_folding: hide
+      theme: lumen
+      toc: yes
+      toc_float:
+        collapsed: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+
+library(dplyr)
+library(janitor)
+library(readxl)
+library(skimr)
+library(gt)
+library(stringr)
+library(text2vec)
+library(LDAvis)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(tidymodels)
+library(tidytext)
+library(stopwords)
+library(purrr)
+library(textrecipes)
+library(discrim)
+library(vip)
+library(themis)
+library(jsonlite)
+library(qdapRegex)
+library(tictoc)
+
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
+
+vacias <- c(stopwords("es"))
+set.seed(4321)
+n_tokens <- 900
+
+```
+
+
+
+# Ingestión
+
+Son `r n_tokens` tokens.
+
+Leer el texto
+
+```{r}
+textos <- arrow::read_feather("datos/RUTA.feather") %>% 
+  mutate(path = str_remove(path,coll("E:\\DATASETS\\RUTA\\DATA\\"))) %>% 
+  mutate(pages = as.numeric(pages)) %>% 
+  na.omit()
+
+```
+
+Leer los metadatos
+```{r}
+crudos <- read_excel("datos/RDC_2019_V1.xlsx") %>% 
+  clean_names() 
+
+datos <- crudos  %>% 
+  select(code,
+         modo,
+         name, 
+         datecreated, 
+         datemodified,
+         author,
+         org_interesada_remitente,
+         org_interesada_destinatario,
+         nombre_fichero,
+         mimetype,
+         size,
+         path,
+         area,
+         nombre_tipo_documental,
+         nombre_padre,
+         nombre_abuelo,
+         en_expte,
+         nombre_serie_documental) %>% 
+  unite(org_interesada,org_interesada_remitente:org_interesada_destinatario,
+        remove = TRUE,
+        na.rm = TRUE) %>% 
+  mutate(
+    date_created = ymd_hms(datecreated,tz = "UTC") - hours(5),
+    date_modified = ymd_hms(datemodified,tz = "UTC") - hours(5)
+    ) %>% 
+   mutate(
+    mes_creacion = month(datecreated,label = TRUE,abbr = FALSE),
+    dia_semana_creacion = wday(datecreated,label = TRUE, 
+                               week_start = 1,abbr = FALSE),
+    dia_creacion = day(datecreated),
+    hora_creacion = hour(datecreated),
+    mes_modificacion = month(datemodified,label = TRUE,abbr = FALSE),
+    dia_semana_modificacion = wday(datemodified,label = TRUE,
+                                   week_start = 1,abbr = FALSE),
+    dia_modificacion = day(datemodified),
+    hora_modificacion = hour(datemodified)) %>% 
+  rename(mime_type = mimetype) %>% 
+  na.omit()
+
+```
+
+Limpiar y añadir tipo
+```{r}
+
+a_excluir <- c("100","CAC")
+datos <- datos %>%
+  mutate(
+    tipo = factor(if_else(
+      area  %in% a_excluir,"otros",area))
+  )
+```
+
+Guardamos el número de tipos diferentes considerados:
+```{r}
+n_tipos <- datos %>% 
+  select(tipo) %>% 
+  distinct() %>% 
+  pull() %>% 
+  length()
+
+```
+
+
+Unir texto y metatadatos
+
+```{r}
+todo <- left_join(datos,textos, by = "path",keep = TRUE) %>% 
+  na.omit() %>% 
+  select(-c(path.y,code.y)) %>% 
+  rename(path = path.x,
+         code = code.x)
+
+todo_textos <- todo %>% 
+  select(path,tipo,pages,text) %>% 
+  mutate( 
+   text = str_replace_all(text, "[^[:alpha:]]", " "),
+         # Quita espacios en blanco múltiples
+   text = str_replace_all(text, "\\s+", " "),
+         # Convierte palabras con acento a sin acento
+   text = iconv(text,from = "UTF-8",to = "ASCII//TRANSLIT"),
+   text = rm_nchar_words(text, "1"))
+  
+
+``` 
+
+# Procesamiento del texto
+
+Esto es para el modelo descriptivoy no es necesario correrlo de nuevo
+aqui
+```{r, eval= FALSE}
+
+palabras <- todo %>% 
+  select(path,tipo,text) %>% 
+  unnest_tokens(word,text) %>%
+  filter(!word %in% vacias,
+         str_detect(word, "[a-z]"),
+         str_length(word) > 1) %>% 
+  mutate(
+    word = iconv(word,from = "UTF-8",to = "ASCII//TRANSLIT")
+  )
+ 
+palabras_todo <- todo %>% 
+  select(path,tipo,text) %>% 
+  unnest_tokens(word,text) %>%
+  filter(!word %in% vacias,
+         str_detect(word, "[a-z]"),
+         str_length(word) > 1) %>% 
+  mutate(
+    word = iconv(word,from = "UTF-8",to = "ASCII//TRANSLIT")
+  ) %>% 
+  group_by(path,word) %>% 
+  tally() %>% 
+  ungroup()
+
+
+documentos_tipo <- todo %>% 
+  select(path,tipo)
+  
+
+palabras_todo <- left_join(palabras_todo,documentos_tipo)
+
+palabras_documento <-  todo %>% 
+  select(path,text) %>% 
+  unnest_tokens(word,text) %>%
+  filter(!word %in% vacias,
+         str_detect(word, "[a-z]"),
+         str_length(word) > 1) %>% 
+  mutate(
+    word = iconv(word,from = "UTF-8",to = "ASCII//TRANSLIT")
+  ) %>% 
+  group_by(path) %>% 
+  tally(name = "total")
+
+palabras_todo <- left_join(palabras_todo,palabras_documento)
+
+palabras_tf_idf <- palabras_todo %>% 
+  bind_tf_idf(word,path,n)
+
+
+```
+
+## Paso 1: División
+```{r}
+division <- initial_split(todo_textos, strata = tipo)
+entrenamiento <- training(division)
+prueba <- testing(division)
+pliegos <- vfold_cv(entrenamiento,strata = tipo)
+```
+
+## Paso 2: Especificación del modelo
+
+Esta es la de random forest:
+```{r}
+rf_spec <- rand_forest() %>%
+  set_args(trees = 500) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+```
+
+## Paso 3: Establecer la receta
+```{r}
+receta <- recipe(tipo ~ text + pages,
+                 data = entrenamiento) %>% 
+  step_upsample(tipo, over_ratio = 1) %>% 
+  step_tokenize(text) %>% 
+  step_stopwords(text,language = "es") %>%
+  step_tokenfilter(text,max_tokens = n_tokens) %>% 
+  step_tfidf(text) 
+
+```
+
+Verificar la receta
+
+```{r}
+prep(receta)
+```
+## Paso 4: Definir el flujo
+
+### Con random forest
+```{r}
+flujo <- workflow() %>% 
+  add_model(rf_spec) %>% 
+  add_recipe(receta)
+```
+
+## Paso 5: Ajustar el modelo
+
+```{r}
+tic()
+modelo_rs <- fit_resamples(
+  flujo,
+  pliegos,
+  control = control_resamples(save_pred = TRUE)
+  #metrics = metric_set(accuracy, sensitivity, specificity)
+)
+toc()
+```
+
+## Paso 6: Evaluar el modelo
+
+```{r}
+metricas <- collect_metrics(modelo_rs)
+predicciones <- collect_predictions(modelo_rs)
+metricas
+
+```
+
+### Graficar curvas ROC
+Produce un error
+```{r, error = TRUE}
+predicciones %>%
+  group_by(id) %>%
+  roc_curve(truth = tipo, .pred_110: .pred_otros) %>%
+  autoplot() +
+  labs(
+    color = NULL,
+    title = "ROC para meta_ubicación",
+    subtitle = "Cada pliego un color diferente"
+  )
+```
+
+### Matrices de confusión
+
+Solo para el primer pliego:
+```{r}
+predicciones %>% 
+  filter(id == "Fold01") %>%
+  conf_mat(tipo, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+### Comparación con el modelo nulo
+El resultado del modelo de ser mejor a esto para que tenga sentido
+```{r}
+null_classification <- null_model() %>%
+  set_engine("parsnip") %>%
+  set_mode("classification")
+
+null_rs <- workflow() %>%
+  add_recipe(receta) %>%
+  add_model(null_classification) %>%
+  fit_resamples(
+    pliegos
+  )
+
+null_rs %>%
+  collect_metrics()
+```
+
+### Comparación con el conjunto de prueba
+Verificacion con el conjunto de prueba:
+
+```{r}
+final_rf <- flujo %>% 
+  last_fit(split = division)
+
+```
+Predicciones y m'etricas
+
+```{r}
+final_res_metrics <- collect_metrics(final_rf)
+final_res_predictions <- collect_predictions(final_rf)
+final_res_metrics
+
+```
+
+### Importancia de variables
+
+
+```{r}
+final_rf %>% 
+  pluck(".workflow", 1) %>%   
+  pull_workflow_fit() %>% 
+  vip(num_features = 15)
+```
+
+### Matriz de confusión final
+```{r}
+final_res_predictions %>%
+  conf_mat(truth = tipo, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+```

@@ -1,0 +1,367 @@
+---
+title: 'Ruta del Cacao'
+subtitle: "Modelización del segundo nivel de la jerarquía"
+output: 
+    html_document: 
+      code_download: true 
+      number_sections: yes
+      code_folding: hide
+      theme: lumen
+      toc: yes
+      toc_float:
+        collapsed: yes
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+# Introducción
+
+Aquí exploramos como sería la clasificación en el segundo nivel.
+Especificamente para `nombre_serie_documental`. La idea es seleccionar
+solo los documentos de un área específica y aplicar el mismo esquema de
+clasificación que usamos en área
+
+```{r, include = FALSE}
+library(dplyr)
+library(janitor)
+library(readxl)
+library(skimr)
+library(gt)
+library(stringr)
+library(text2vec)
+library(LDAvis)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(tidymodels)
+library(tidytext)
+library(stopwords)
+library(purrr)
+library(textrecipes)
+library(discrim)
+library(vip)
+library(themis)
+library(tictoc)
+library(ranger)
+library(readr)
+
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
+
+set.seed(4321)
+
+# Si una serie documental tiene menos de quiebre% de representación en el conjunto
+# de datos, entonces se ignora y se reclasifica como "otros"
+
+quiebre <- 1
+
+### Leer y limpiar -------------------------------------------------------------
+crudos <- read_excel("datos/RDC_2019_V1.xlsx") %>%
+  clean_names()
+
+datos <- crudos  %>%
+  select(code,
+         modo,
+         name,
+         datecreated,
+         datemodified,
+         author,
+         org_interesada_remitente,
+         org_interesada_destinatario,
+         nombre_fichero,
+         mimetype,
+         size,
+         path,
+         area,
+         nombre_tipo_documental,
+         nombre_padre,
+         nombre_abuelo,
+         en_expte,
+         nombre_serie_documental) %>%
+  unite(org_interesada,org_interesada_remitente:org_interesada_destinatario,
+        remove = TRUE,
+        na.rm = TRUE) %>%
+  mutate(
+    date_created = ymd_hms(datecreated,tz = "UTC") - hours(5),
+    date_modified = ymd_hms(datemodified,tz = "UTC") - hours(5)
+  ) %>%
+  mutate(
+    mes_creacion = month(datecreated,label = TRUE,abbr = FALSE),
+    dia_semana_creacion = wday(datecreated,label = TRUE,
+                               week_start = 1,abbr = FALSE),
+    dia_creacion = day(datecreated),
+    hora_creacion = hour(datecreated),
+    mes_modificacion = month(datemodified,label = TRUE,abbr = FALSE),
+    dia_semana_modificacion = wday(datemodified,label = TRUE,
+                                   week_start = 1,abbr = FALSE),
+    dia_modificacion = day(datemodified),
+    hora_modificacion = hour(datemodified)) %>%
+  rename(mime_type = mimetype) %>%
+  na.omit()
+
+
+### Definir tipo ---------------------------------------------------------------
+
+a_excluir <- c("100","CAC")
+datos <- datos %>%
+  mutate(
+    tipo = factor(if_else(
+      area  %in% a_excluir,"otros",area))
+  )
+
+
+```
+
+Vamos a explorar con las clasificaciones para una área específica, por
+ejemplo, la 400:
+
+```{r}
+datos_400 <- datos %>% 
+  filter(tipo == 400)
+
+
+```
+
+Hay `r dim(datos_400)[1]` documentos en esta área.
+
+Veamos los nombres de serie documental en 400:
+
+```{r}
+tabla <- datos_400 %>% 
+  group_by(nombre_serie_documental) %>% 
+  tally() %>% 
+  arrange(desc(n)) %>% 
+  mutate(
+    total = sum(n),
+    porcentaje = (n/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+```
+
+Hay 9 categorías pero varias con muy pocas observaciones. En lo que
+sigue, exploraremos diferentes formas de definir mejor estas
+clasificaciones
+
+
+
+
+# Primera forma
+
+Hacemos lo que hemos hecho hasta ahora: Seleccionamos todas las
+categorías minoritarias y las agrupamos bajo "otros". Sabemos que esto
+no necesariamente es lo mejor, pero nos puede dar una idea.
+
+Note que lo que hacemos es redefinir el tipo para que ahora contenga el
+nombre de la serie documental
+
+```{r}
+otros <- c("400-CONSTRUCCION","500-DIRECCION CALIDAD, AMBIENTE Y PREVENCION DE RIESGO",
+          "Actas de Cierre y entrega de las Unidades Funcionales", "Planes de Obras",
+          "Proceso de Adquisicion","Programas de Seguridad y Salud en el Trabajo")
+datos_400 <- datos_400 %>%
+  mutate(
+    tipo = factor(if_else(
+      nombre_serie_documental %in% otros,"otros",nombre_serie_documental))
+  )
+
+datos_400 %>% 
+  group_by(tipo) %>% 
+  tally()
+
+```
+
+Ahora procedemos como usual.
+
+Primero, hacemos la división
+
+```{r}
+division <- initial_split(datos_400, strata = tipo)
+entrenamiento <- training(division)
+prueba <- testing(division)
+pliegos <- vfold_cv(entrenamiento,strata = tipo)
+```
+
+La especificación del modelo (que en realidad no depende para nada de
+los datos)
+
+```{r}
+rf_spec <- rand_forest() %>%
+  set_args(trees = 500) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+```
+
+La receta:
+
+```{r}
+### Receta ---------------------------------------------------------------------
+receta <- recipe(tipo ~
+                   org_interesada +
+                   mime_type +
+                   size +
+                   name +
+                   nombre_fichero +
+                   mes_creacion +
+                   dia_semana_creacion +
+                   dia_creacion +
+                   hora_creacion +
+                   mes_modificacion +
+                   dia_semana_modificacion +
+                   dia_modificacion +
+                   hora_modificacion,
+                 data = entrenamiento)
+
+
+receta_no <- receta %>%
+  step_upsample(tipo, over_ratio = 1) %>%
+  step_normalize(size) %>%
+  step_other(org_interesada,
+             mime_type,
+             mes_creacion,
+             dia_semana_creacion,
+             mes_modificacion,
+             dia_semana_modificacion,
+             threshold = 0.01,
+             other = "otro") %>%
+  step_tokenize(c(name,nombre_fichero)) %>%
+  step_stopwords(c(name, nombre_fichero),language = "es") %>%
+  step_tokenfilter(c(name,nombre_fichero)) %>%
+  step_tfidf(c(name,nombre_fichero))
+
+```
+
+El flujo de trabajo
+
+```{r}
+flujo <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(receta_no)
+```
+
+Y el ajuste
+
+```{r}
+final_rf <- flujo %>%
+  last_fit(split = division)
+
+final_res_metrics <- collect_metrics(final_rf)
+final_res_predictions <- collect_predictions(final_rf)
+correlacion_matthews <- mcc(final_res_predictions,truth = tipo, estimate = .pred_class)
+final_res_metrics <- bind_rows(final_res_metrics, correlacion_matthews) %>%
+  select(-.config)
+
+final_res_metrics
+
+write_csv(final_res_metrics,"ficha_metadatos_2nivel.csv")
+
+```
+
+Veamos si estos resultados se pueden mejorar usando otro tipo de
+clasificación previa de `nombre_serie_documental`
+
+# Segunda forma
+
+En vez de clasificar como "otros", vamos a omitir las clases
+minoritarias y obtenemos la clasificación solo para las restantes
+
+```{r}
+datos_400_otra <- datos %>% 
+  filter(tipo == 400) %>% 
+  filter(!(nombre_serie_documental %in% c("400-CONSTRUCCION",
+                                          "500-DIRECCION CALIDAD, AMBIENTE Y PREVENCION DE RIESGO",
+                                          "Actas de Cierre y entrega de las Unidades Funcionales",
+                                          "Proceso de Adquisicion",
+                                          "Programas de Seguridad y Salud en el Trabajo")))
+
+# Verificamos
+datos_400_otra %>% 
+  group_by(nombre_serie_documental) %>% 
+  tally()
+
+# Convertimos a tipo
+datos_400_otra <- datos_400_otra %>%
+  mutate(
+    tipo = factor(nombre_serie_documental)
+    )
+
+
+```
+
+```{r}
+division_otra <- initial_split(datos_400_otra, strata = tipo)
+entrenamiento_otra <- training(division_otra)
+prueba_otra <- testing(division_otra)
+pliegos_otra <- vfold_cv(entrenamiento_otra,strata = tipo)
+```
+
+```{r}
+### Receta ---------------------------------------------------------------------
+receta <- recipe(tipo ~
+                   org_interesada +
+                   mime_type +
+                   size +
+                   name +
+                   nombre_fichero +
+                   mes_creacion +
+                   dia_semana_creacion +
+                   dia_creacion +
+                   hora_creacion +
+                   mes_modificacion +
+                   dia_semana_modificacion +
+                   dia_modificacion +
+                   hora_modificacion,
+                 data = entrenamiento_otra)
+
+
+receta_no <- receta %>%
+  step_upsample(tipo, over_ratio = 1) %>%
+  step_normalize(size) %>%
+  step_other(org_interesada,
+             mime_type,
+             mes_creacion,
+             dia_semana_creacion,
+             mes_modificacion,
+             dia_semana_modificacion,
+             threshold = 0.01,
+             other = "otro") %>%
+  step_tokenize(c(name,nombre_fichero)) %>%
+  step_stopwords(c(name, nombre_fichero),language = "es") %>%
+  step_tokenfilter(c(name,nombre_fichero)) %>%
+  step_tfidf(c(name,nombre_fichero))
+
+```
+
+```{r}
+flujo <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(receta_no)
+```
+
+```{r}
+final_rf_otra <- flujo %>%
+  last_fit(split = division_otra)
+
+final_res_metrics_otra <- collect_metrics(final_rf_otra)
+final_res_predictions_otra <- collect_predictions(final_rf_otra)
+correlacion_matthews_otra <- mcc(final_res_predictions_otra,truth = tipo, estimate = .pred_class)
+final_res_metrics_otra <- bind_rows(final_res_metrics_otra, correlacion_matthews_otra) %>%
+  select(-.config)
+
+final_res_metrics_otra
+write_csv(final_res_metrics,"ficha_metadatos_2nivel_otra.csv")
+
+```
+
+# A manera de conclusiones 
+
+En la reunión se decidió elimnar de consideración los tipos que ocurren por
+debajo de un umbral dado. Eso es lo que se ensaya en el segundo documento de
+esta serie. 

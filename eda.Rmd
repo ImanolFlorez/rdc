@@ -1,0 +1,1399 @@
+---
+title: 'RDC'
+subtitle: "Análisis exploratorio de Datos"
+date: '`r format(Sys.Date(), " %A %d de %B %Y")`'
+output: 
+    html_document: 
+      code_download: true 
+      number_sections: yes
+      code_folding: hide
+      theme: lumen
+      toc: yes
+      toc_float:
+        collapsed: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(janitor)
+library(readxl)
+library(skimr)
+library(gt)
+library(stringr)
+library(text2vec)
+library(LDAvis)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(tidymodels)
+library(tidytext)
+library(stopwords)
+library(purrr)
+
+
+```
+
+```{r}
+set.seed(4321)
+```
+
+# Introducción
+Este documento describe de manera general las entradas y salidas
+del conjunto de datos que corresponde a la **Ruta del Cacao (rdc)**.
+
+
+# Lectura de los datos
+```{r leer datos}
+crudos <- read_excel("datos/RDC_2019_V1.xlsx") %>% 
+  clean_names()
+
+datos <- crudos %>% 
+  select(code,
+         modo,
+         name, 
+         datecreated, 
+         datemodified,
+         author,
+         org_interesada_remitente,
+         org_interesada_destinatario,
+         nombre_fichero,
+         mimetype,
+         size,
+         path,
+         area,
+         nombre_tipo_documental,
+         nombre_padre,
+         nombre_abuelo,
+         en_expte,
+         nombre_serie_documental) %>% 
+  unite(org_interesada,org_interesada_remitente:org_interesada_destinatario,
+        remove = TRUE,
+        na.rm = TRUE) %>% 
+  mutate(
+    datecreated = ymd_hms(datecreated,tz = "UTC") - hours(5),
+    datemodified = ymd_hms(datemodified,tz = "UTC") - hours(5)
+    )
+  
+
+
+
+diccionario <- datos %>% 
+  skim() %>% 
+  as_tibble() %>% 
+  rename(
+    tipo = skim_type,
+    nombre = skim_variable,
+    n_faltantes = n_missing,
+    completitud = complete_rate,
+    min_longitud = character.min,
+    max_longitud = character.max,
+    longitud_0 = character.empty,
+    distintos = character.n_unique,
+    en_blanco = character.whitespace,
+    media_logicos = logical.mean,
+    cuenta_logicos = logical.count,
+    media = numeric.mean,
+    ds = numeric.sd,
+    p0 = numeric.p0,
+    p25 = numeric.p25,
+    p50 = numeric.p50,
+    p75 = numeric.p75,
+    p100 = numeric.p100,
+    histograma = numeric.hist)
+    
+n_registros <- datos %>% 
+  tally() %>% 
+  pull()
+
+
+```
+
+
+
+# Diccionario de datos
+
+ - Hay un total de: `r n_registros` en el conjunto de datos
+ - La variable identificadora es `path`
+
+## Variables tipo caracter:
+
+```{r diccionario caracter}
+diccionario %>% 
+  filter(tipo == "character") %>% 
+  select(nombre:distintos) %>% 
+  gt() %>% 
+  fmt_number(
+    columns = vars(completitud),
+    decimals = 1
+  ) %>% 
+  cols_label(
+    nombre = "Variable",
+    n_faltantes = "Faltantes",
+    completitud = "Completitud",
+    min_longitud = md("Longitud <br> mínima"),
+    max_longitud = md("Longitud <br> máxima"),
+    longitud_0 = "Vacíos",
+    distintos = "Distintos"
+    
+  )
+```
+
+
+## Variables numéricas
+```{r diccionario numericos}
+diccionario %>% 
+  filter(tipo == "numeric") %>% 
+  select(nombre:completitud,media:histograma) %>% 
+  gt() %>% 
+  fmt_number(
+    columns = vars(completitud),
+    decimals = 1
+  ) %>% 
+  fmt_number(
+    columns = 4:10,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>% 
+  tab_spanner(
+    label = "Percentil",
+    columns = vars(p0,p25,p50,p75,p100)
+  ) %>% 
+  cols_label(
+    nombre = "Variable",
+    n_faltantes = "Faltantes",
+    completitud = "Completitud",
+    media = "Promedio",
+    ds = md("Desviación <br> estándar"),
+    histograma = "Histograma"
+  ) 
+```
+
+## Variables Lógicas
+```{r}
+diccionario %>% 
+  filter(tipo == "logical") %>% 
+  select(nombre:completitud,media_logicos:cuenta_logicos) %>% 
+  gt() %>% 
+  fmt_number(
+    columns = vars(completitud),
+    decimals = 1
+  ) %>% 
+  fmt_number(
+    columns = vars(media_logicos),
+    decimals = 1
+  ) %>% 
+   cols_label(
+    nombre = "Variable",
+    n_faltantes = "Faltantes",
+    completitud = "Completitud",
+    media_logicos = "Promedio",
+    cuenta_logicos = "Frecuencia"
+  ) 
+  
+```
+
+## Fechas
+```{r}
+diccionario %>% 
+  filter(tipo == "POSIXct") %>% 
+  select(nombre:completitud,starts_with("POSIXct")) %>% 
+  gt() %>% 
+  fmt_number(
+    columns = vars(completitud),
+    decimals = 1) %>% 
+   cols_label(
+    nombre = "Variable",
+    n_faltantes = "Faltantes",
+    completitud = "Completitud",
+    POSIXct.min = "Mínima",
+    POSIXct.max = "Máxima",
+    POSIXct.median = "Mediana",
+    POSIXct.n_unique = "Unicas"
+   )
+```
+
+
+
+Los datos están muy completos.
+
+# Caracterización general de las Salidas
+## En expediente
+
+```{r}
+tabla_en_expte <- datos %>% 
+  group_by(en_expte) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_en_expte %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    en_expte = md("`en_expte`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+
+```
+
+```{r}
+tabla_en_expte %>% 
+  ggplot(aes(x = reorder(en_expte,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+
+```
+
+
+## Salida 1: Area
+
+```{r}
+distintos_area <- diccionario %>% 
+  filter(nombre == "area") %>% 
+  select(distintos) %>% 
+  pull()
+```
+
+Hay `r distintos_area` valores de `area`  
+
+
+### Tabla de distribución general
+```{r}
+
+tabla_area <- datos %>% 
+  group_by(area) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_area %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    area = md("`Area`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+   
+```
+
+### Gráfico de distribución general
+```{r}
+tabla_area %>% 
+  filter(posicion <= 10) %>% 
+  ggplot(aes(x = reorder(area,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+```
+
+## Salida 2: Nombre serie documental
+
+```{r}
+distintos_nombre_serie_documental <- datos %>% 
+  filter(en_expte == TRUE) %>% 
+  distinct(nombre_serie_documental) %>% 
+  n_distinct()
+```
+
+Hay `r distintos_nombre_serie_documental` valores de `nombre_serie_documental`  
+
+
+### Tabla de distribución general
+
+```{r}
+
+tabla_nombre_serie_documental <- datos %>% 
+  filter(en_expte == TRUE) %>% 
+  group_by(nombre_serie_documental) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_nombre_serie_documental %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    nombre_serie_documental = md("`nombre_serie_documental`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+   
+```
+
+### Gráfico de distribución general (Top 10)
+
+```{r}
+tabla_nombre_serie_documental %>% 
+  filter(posicion <= 10) %>% 
+  ggplot(aes(x = reorder(nombre_serie_documental,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+```
+
+
+## Salida 3: Nombre del tipo documental
+
+```{r}
+distintos_tipo_documental <- datos %>% 
+  filter(en_expte == TRUE) %>% 
+  distinct(nombre_tipo_documental) %>% 
+  n_distinct()
+```
+
+Hay `r distintos_tipo_documental` valores de `nombre_tipo_documental`  
+
+
+### Tabla de distribución general
+```{r}
+
+tabla_tipo_documental <- datos %>% 
+  filter(en_expte == TRUE) %>% 
+  group_by(nombre_tipo_documental) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_tipo_documental %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    nombre_tipo_documental = md("`nombre_tipo_documental`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+   
+```
+
+### Gráfico de distribución general (Top 10)
+```{r}
+tabla_tipo_documental %>% 
+  filter(posicion <= 10) %>% 
+  ggplot(aes(x = reorder(nombre_tipo_documental,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+```
+
+
+
+## Salida 4: Nombre del padre
+
+```{r}
+distintos_nombre_padre <- datos %>% 
+  filter(en_expte == TRUE) %>% 
+  distinct(nombre_padre) %>% 
+  n_distinct()
+```
+
+Hay `r distintos_nombre_padre` valores de `nombre_padre`  
+
+
+### Tabla de distribución general
+
+```{r}
+
+tabla_nombre_padre <- datos %>%
+  filter(en_expte == TRUE) %>% 
+  group_by(nombre_padre) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_nombre_padre %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    nombre_padre = md("`nombre_padre`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+   
+```
+
+### Gráfico de distribución general (Top 10)
+
+```{r}
+tabla_nombre_padre %>% 
+  filter(posicion <= 10) %>% 
+  ggplot(aes(x = reorder(nombre_padre,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+```
+
+
+
+## Salida 5: Nombre Abuelo
+```{r}
+distintos_nombre_abuelo <- datos %>% 
+  filter(en_expte == TRUE) %>% 
+  distinct(nombre_abuelo) %>% 
+  n_distinct()
+```
+
+Hay `r distintos_nombre_abuelo` valores de `nombre_abuelo`  
+
+
+### Tabla de distribución general
+
+```{r}
+
+tabla_nombre_abuelo <- datos %>% 
+  filter(en_expte == TRUE) %>% 
+  group_by(nombre_abuelo) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_nombre_abuelo %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    nombre_abuelo = md("`nombre_abuelo`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+   
+```
+
+### Gráfico de distribución general (Top 10)
+```{r}
+tabla_nombre_abuelo %>% 
+  filter(posicion <= 10) %>% 
+  ggplot(aes(x = reorder(nombre_abuelo,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+```
+
+
+
+
+
+
+# Caracterización general de las entradas
+
+## Modo
+
+```{r}
+distintos_modo <- diccionario %>% 
+  filter(nombre == "modo") %>% 
+  select(distintos) %>% 
+  pull()
+```
+
+Hay `r distintos_modo` valores de `modo`  
+
+
+### Tabla de distribución general
+
+```{r}
+
+tabla_modo <- datos %>% 
+  group_by(modo) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_modo %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    modo = md("`modo`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+   
+```
+
+### Gráfico de distribución general (Top 10)
+
+```{r}
+tabla_modo %>% 
+  filter(posicion <= 10) %>% 
+  ggplot(aes(x = reorder(modo,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+```
+
+## Entrada 2: Organización interesada
+
+```{r}
+distintos_organizacion_interesada <- diccionario %>% 
+  filter(nombre == "org_interesada") %>% 
+  select(distintos) %>% 
+  pull()
+```
+
+Hay `r distintos_organizacion_interesada` valores de `org_interesada`  
+
+
+### Tabla de distribución general
+
+```{r}
+
+tabla_organizacion_interesada <- datos %>% 
+  group_by(org_interesada) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_organizacion_interesada %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    org_interesada = md("`org_interesada`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+   
+```
+
+### Gráfico de distribución general (Top 10)
+
+```{r}
+tabla_organizacion_interesada %>% 
+  filter(posicion <= 10) %>% 
+  ggplot(aes(x = reorder(org_interesada,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+```
+
+## Entrada 3: Autor
+
+```{r}
+distintos_autor <- diccionario %>% 
+  filter(nombre == "author") %>% 
+  select(distintos) %>% 
+  pull()
+```
+
+### Distribución general de los autores:
+```{r}
+tabla_autor <- datos %>% 
+  group_by(author) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_autor %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    author = md("`author`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+ 
+```
+
+
+
+
+### Gráfico de distribución general
+```{r}
+
+autores_principales <- tabla_autor  %>% 
+  filter(posicion <= 10) %>%
+  select(author) %>% 
+  pull()
+ 
+
+tabla_autor  %>% 
+  filter(posicion <= 10) %>% 
+  ggplot(aes(x = reorder(author,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+```
+
+## Entrada 4: Mimetype
+
+```{r}
+distintos_mime_type <- diccionario %>% 
+  filter(nombre == "mimetype") %>% 
+  select(distintos) %>% 
+  pull()
+```
+
+
+### Distribución general de los tipos:
+```{r}
+tabla_mime_type <- datos %>% 
+  group_by(mimetype) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() 
+
+tabla_mime_type %>%
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3:4,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    mimetype = md("`mimetype`"),
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    acumulado = "Acumulado",
+    posicion = " ")
+ 
+```
+
+### Gráfico de distribución general
+```{r}
+tabla_mime_type  %>% 
+  filter(posicion <= 10) %>% 
+  ggplot(aes(x = reorder(mimetype,frecuencia), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab(NULL) +
+  ylab("Frecuencia") +
+  scale_x_discrete(labels = function(x) 
+    str_wrap(str_replace_all(x,"/"," "), 
+             width = 20)) +
+  coord_flip()
+```
+
+
+## Entrada 5: Tamaño
+
+```{r}
+datos %>% 
+  ggplot(aes(x = size)) + 
+  geom_histogram() +
+  labs(x = "Tamaño del archivo",
+       y = "Frecuencia")
+  
+```
+
+
+
+## Entrada 6: Nombre
+
+```{r}
+vacias <- c(stopwords("es"))
+
+name_palabras <- datos %>% 
+  select(path,name) %>% 
+  unnest_tokens(word,name) %>%
+  filter(!word %in% vacias,
+         str_detect(word, "[a-z]"),
+         str_length(word) > 1) %>% 
+  mutate(
+    word = iconv(word,from = "UTF-8",to = "ASCII//TRANSLIT")
+  )
+  
+name_frecuencia <- name_palabras %>% 
+  count(word, sort = TRUE) %>% 
+  mutate(
+    total = sum(n),
+    porcentaje = (n/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+
+distintos_name <- name_palabras %>%  
+  distinct(word) %>% 
+  count() %>% 
+  pull()
+  
+
+```
+
+Hay un total de `r distintos_name` palabras en `name` luego de la
+limpieza
+
+
+```{r}
+  name_frecuencia %>% 
+    filter(porcentaje >= 1) %>% 
+    gt() %>% 
+    fmt_number(
+      columns = 3,
+      decimals = 1,
+      use_seps = FALSE
+      ) %>% 
+    cols_label(
+      word = "Palabra",
+      n = "Frecuencia",
+      porcentaje = "%",
+    )
+
+```
+
+
+## Entrada 7: Nombre fichero
+
+```{r}
+vacias <- c(stopwords("es"))
+
+nombre_fichero_palabras <- datos %>% 
+  select(path,nombre_fichero) %>% 
+  unnest_tokens(word,nombre_fichero) %>%
+  filter(!word %in% vacias,
+         str_detect(word, "[a-z]"),
+         str_length(word) > 1) %>% 
+  mutate(
+    word = iconv(word,from = "UTF-8",to = "ASCII//TRANSLIT")
+  )
+  
+nombre_fichero_frecuencia <- nombre_fichero_palabras %>% 
+  count(word, sort = TRUE) %>% 
+  mutate(
+    total = sum(n),
+    porcentaje = (n/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+
+distintos_nombre_fichero <- nombre_fichero_palabras %>%  
+  distinct(word) %>% 
+  count() %>% 
+  pull()
+  
+
+```
+
+Hay un total de `r distintos_nombre_fichero` palabras en `nombre_fichero` luego de la
+limpieza
+
+
+```{r}
+  nombre_fichero_frecuencia %>% 
+    filter(porcentaje >= 1) %>% 
+    gt() %>% 
+    fmt_number(
+      columns = 3,
+      decimals = 1,
+      use_seps = FALSE
+      ) %>% 
+    cols_label(
+      word = "Palabra",
+      n = "Frecuencia",
+      porcentaje = "%",
+    )
+
+```
+
+
+
+
+
+## Entrada 8: Fecha de Creación
+
+```{r}
+datos <- datos %>% 
+  mutate(
+    mes_creacion = month(datecreated,label = TRUE,abbr = FALSE),
+    dia_semana_creacion = wday(datecreated,label = TRUE,week_start = 1,abbr = FALSE),
+    dia_creacion = day(datecreated),
+    hora_creacion = hour(datecreated) 
+  )
+ 
+```
+
+### Mes
+
+#### Distribución general:
+```{r}
+tabla_mes_creacion <- datos %>% 
+  group_by(mes_creacion) %>% 
+  summarize(frecuencia = n()) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+tabla_mes_creacion %>% 
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    mes_creacion = "Mes",
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    )
+ 
+```
+
+#### Gráfico de distribución general
+```{r}
+tabla_mes_creacion  %>% 
+  ggplot(aes(x = as.factor(mes_creacion), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab("Mes") +
+  ylab("Frecuencia") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  
+
+```
+
+### Día de la semana
+
+#### Distribución general:
+```{r}
+tabla_dia_semana_creacion <- datos %>% 
+  group_by(dia_semana_creacion) %>% 
+  summarize(frecuencia = n()) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+tabla_dia_semana_creacion %>% 
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    dia_semana_creacion = "Día",
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    )
+ 
+```
+
+#### Gráfico de distribución general
+```{r}
+tabla_dia_semana_creacion  %>% 
+  ggplot(aes(x = as.factor(dia_semana_creacion), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab("Día") +
+  ylab("Frecuencia") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  
+
+```
+
+
+### Día
+
+#### Distribución general:
+```{r}
+tabla_dia_creacion <- datos %>% 
+  group_by(dia_creacion) %>% 
+  summarize(frecuencia = n()) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+tabla_dia_creacion %>% 
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    dia_creacion = "Día",
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    )
+ 
+```
+
+#### Gráfico de distribución general
+```{r}
+tabla_dia_creacion  %>% 
+  ggplot(aes(x = as.factor(dia_creacion), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab("Día") +
+  ylab("Frecuencia") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  
+
+```
+
+
+### Hora
+
+#### Distribución general:
+```{r}
+tabla_hora_creacion <- datos %>% 
+  group_by(hora_creacion) %>% 
+  summarize(frecuencia = n()) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+tabla_hora_creacion %>% 
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    hora_creacion = "Hora",
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    )
+ 
+```
+
+#### Gráfico de distribución general
+```{r}
+tabla_hora_creacion  %>% 
+  ggplot(aes(x = as.factor(hora_creacion), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab("Hora") +
+  ylab("Frecuencia") 
+  
+
+```
+
+
+## Entrada 9: Fecha de Modificación
+
+```{r}
+
+datos <- datos %>% 
+  mutate(date_modified = datemodified) %>%
+  mutate(
+    mes_modificacion = month(date_modified,label = TRUE,abbr = FALSE),
+    dia_semana_modificacion = wday(date_modified,label = TRUE,week_start = 1,abbr = FALSE),
+    dia_modificacion = day(date_modified),
+    hora_modificacion = hour(date_modified)
+  )
+
+
+```
+
+### Mes
+#### Distribución general:
+```{r}
+tabla_mes_modificacion <- datos %>% 
+  group_by(mes_modificacion) %>% 
+  summarize(frecuencia = n()) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+tabla_mes_modificacion %>% 
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    mes_modificacion = "Mes",
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    )
+ 
+```
+
+#### Gráfico de distribución general
+```{r}
+tabla_mes_modificacion  %>% 
+  ggplot(aes(x = as.factor(mes_modificacion), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab("Mes") +
+  ylab("Frecuencia") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  
+
+```
+
+### Día de la semana
+
+#### Distribución general:
+```{r}
+tabla_dia_semana_modificacion <- datos %>% 
+  group_by(dia_semana_modificacion) %>% 
+  summarize(frecuencia = n()) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+tabla_dia_semana_modificacion %>% 
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    dia_semana_modificacion = "Día",
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    )
+ 
+```
+
+#### Gráfico de distribución general
+```{r}
+tabla_dia_semana_modificacion  %>% 
+  ggplot(aes(x = as.factor(dia_semana_modificacion), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab("Día") +
+  ylab("Frecuencia") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  
+
+```
+
+
+### Día
+
+#### Distribución general:
+```{r}
+tabla_dia_modificacion <- datos %>% 
+  group_by(dia_modificacion) %>% 
+  summarize(frecuencia = n()) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+tabla_dia_modificacion %>% 
+  gt() %>% 
+  fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    dia_modificacion = "Día",
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    )
+ 
+```
+
+#### Gráfico de distribución general
+```{r}
+tabla_dia_modificacion  %>% 
+  ggplot(aes(x = as.factor(dia_modificacion), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab("Día") +
+  ylab("Frecuencia") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  
+
+```
+
+
+### Hora
+
+#### Distribución general:
+```{r}
+tabla_hora_modificacion <- datos %>% 
+  group_by(hora_modificacion) %>% 
+  summarize(frecuencia = n()) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100
+  ) %>%  
+  select(-total) %>% 
+  ungroup() 
+  
+tabla_hora_modificacion %>% 
+  gt() %>% 
+   fmt_number(
+    columns = 2,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_number(
+    columns = 3,
+    decimals = 1,
+    use_seps = FALSE
+  ) %>% 
+  cols_label(
+    hora_modificacion = "Hora",
+    frecuencia = "Frecuencia",
+    porcentaje = "%",
+    )
+ 
+```
+
+#### Gráfico de distribución general
+```{r}
+tabla_hora_modificacion  %>% 
+  ggplot(aes(x = as.factor(hora_modificacion), y = frecuencia)) + 
+  geom_col(fill = "steel blue") +
+  xlab("Hora") +
+  ylab("Frecuencia") 
+  
+
+```
+
+
+
+
+
+

@@ -1,0 +1,438 @@
+---
+title: 'Ruta del Cacao'
+subtitle: "Modelización: Metadatos con xgboost"
+output: 
+    html_document: 
+      code_download: true 
+      number_sections: yes
+      code_folding: hide
+      theme: lumen
+      toc: yes
+      toc_float:
+        collapsed: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_chunk$set(cache = TRUE)
+library(dplyr)
+library(janitor)
+library(readxl)
+library(skimr)
+library(gt)
+library(stringr)
+library(text2vec)
+library(LDAvis)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(tidymodels)
+library(tidytext)
+library(stopwords)
+library(purrr)
+library(textrecipes)
+library(discrim)
+library(vip)
+library(themis)
+library(tictoc)
+library(ranger)
+library(xgboost)
+
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores - 2)
+
+set.seed(4321)
+```
+# Introducción
+
+Realizamos un modelo con los metadatos de Ruta del Cacaco y 
+utilizando *random forests* y la variable *area*. Las categorías minoritarias
+"CAC"y "100" se clasificaron como "otros'
+
+
+# Ingestión de los datos
+```{r lectura}
+crudos <- read_excel("datos/RDC_2019_V1.xlsx") %>% 
+  clean_names() 
+
+datos <- crudos  %>% 
+  select(code,
+         modo,
+         name, 
+         datecreated, 
+         datemodified,
+         author,
+         org_interesada_remitente,
+         org_interesada_destinatario,
+         nombre_fichero,
+         mimetype,
+         size,
+         path,
+         area,
+         nombre_tipo_documental,
+         nombre_padre,
+         nombre_abuelo,
+         en_expte,
+         nombre_serie_documental) %>% 
+  unite(org_interesada,org_interesada_remitente:org_interesada_destinatario,
+        remove = TRUE,
+        na.rm = TRUE) %>% 
+  mutate(
+    date_created = ymd_hms(datecreated,tz = "UTC") - hours(5),
+    date_modified = ymd_hms(datemodified,tz = "UTC") - hours(5)
+    ) %>% 
+   mutate(
+    mes_creacion = month(datecreated,label = TRUE,abbr = FALSE),
+    dia_semana_creacion = wday(datecreated,label = TRUE, 
+                               week_start = 1,abbr = FALSE),
+    dia_creacion = day(datecreated),
+    hora_creacion = hour(datecreated),
+    mes_modificacion = month(datemodified,label = TRUE,abbr = FALSE),
+    dia_semana_modificacion = wday(datemodified,label = TRUE,
+                                   week_start = 1,abbr = FALSE),
+    dia_modificacion = day(datemodified),
+    hora_modificacion = hour(datemodified)) %>% 
+  rename(mime_type = mimetype) %>% 
+  na.omit()
+      
+  
+
+```
+
+# Limpieza
+
+Excluimos NULL y reclasificamos bajo "otros" categorías menos frecuentes
+
+```{r definicion de tipos}
+
+a_excluir <- c("100","CAC")
+datos <- datos %>%
+  mutate(
+    tipo = factor(if_else(
+      area  %in% a_excluir,"otros",area))
+  )
+#save(datos, file =  "procesados.Rdata" )
+```
+
+Examinamos la nueva distribución de los tipos:
+```{r mostrar tipos}
+datos %>% 
+  group_by(tipo) %>% 
+  summarize(frecuencia = n()) %>%
+  arrange(desc(frecuencia)) %>% 
+  mutate(
+    total = sum(frecuencia),
+    porcentaje = (frecuencia/total)*100,
+    acumulado = cumsum(porcentaje),
+    posicion = 1:n()
+    ) %>%  
+  select(-total) %>% 
+  ungroup() %>% 
+  gt()
+
+```
+
+```{r}
+n_clases <- datos %>% 
+  distinct(tipo) %>% 
+  tally() %>%
+  pull()
+```
+
+# Construcción del modelo
+
+## Paso 1: División
+```{r}
+division <- initial_split(datos, strata = tipo)
+entrenamiento <- training(division)
+prueba <- testing(division)
+pliegos <- vfold_cv(entrenamiento,v = 3,strata = tipo)
+```
+
+## Paso 2: Especificación del modelo
+
+
+Esta es la de random forest, la activa por el m omento
+```{r random forest}
+rf_spec <- rand_forest() %>%
+  set_args(trees = 500) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+```
+
+Esta es la de xgboost, que implementaremos en un futuro cercano
+```{r eval= TRUE}
+xgb_spec <- boost_tree(
+  trees = 10, 
+  tree_depth = tune(), min_n = tune(), 
+  loss_reduction = tune(),                     ## first three: model complexity
+  sample_size = tune(), mtry = tune(),         ## randomness
+  learn_rate = tune(),                         ## step size
+) %>% 
+  set_engine("xgboost",objective = "multi:softprob", eval_metric = "mlogloss",
+             num_class = n_clases, verbose = 2) %>% 
+  set_mode("classification")
+```
+
+
+```{r eval = TRUE}
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), entrenamiento),
+  learn_rate(),
+  size = 2
+)
+```
+
+## Paso 3: Establecer la receta
+```{r receta}
+receta <- recipe(tipo ~
+                   org_interesada +
+                   mime_type + 
+                   size + 
+                   name + 
+                   nombre_fichero + 
+                   mes_creacion +
+                   dia_semana_creacion +
+                   dia_creacion +
+                   hora_creacion +
+                   mes_modificacion +
+                   dia_semana_modificacion +
+                   dia_modificacion +
+                   hora_modificacion,
+                   data = entrenamiento)
+
+```
+
+Convertir la variables en "one hot encoding". No es necesario en este modelo, pero puede ser
+necesario en otros casos:
+
+```{r receta dummy, eval = TRUE}
+receta_dummy <- receta %>% 
+  step_upsample(tipo, over_ratio = 1) %>%
+  step_other(org_interesada,
+             mime_type,
+             mes_creacion,
+             dia_semana_creacion,
+             mes_modificacion,
+             dia_semana_modificacion,
+             threshold = 0.01,
+             other = "otro") %>% 
+  step_dummy(org_interesada) %>% 
+  step_dummy(mime_type) %>% 
+  step_normalize(size) %>% 
+  step_tokenize(c(name,nombre_fichero)) %>% 
+  step_stopwords(c(name, nombre_fichero),language = "es") %>% 
+  step_tokenfilter(c(name,nombre_fichero)) %>% 
+  step_tfidf(c(name,nombre_fichero)) %>% 
+  step_dummy(mes_creacion) %>% 
+  step_dummy(mes_modificacion) %>% 
+  step_dummy(dia_semana_creacion) %>% 
+  step_dummy(dia_semana_modificacion) 
+  
+  
+prep(receta_dummy) %>% 
+  bake(new_data = NULL) %>% 
+  ggplot(aes(tipo)) +
+  geom_bar()
+
+
+```
+
+Receta sin "one hot encoding". No es necesaria para modelos de árbol
+
+```{r receta no}
+receta_no <- receta %>% 
+  step_upsample(tipo, over_ratio = 1) %>% 
+  step_normalize(size) %>% 
+  step_other(org_interesada,
+             mime_type,
+             mes_creacion,
+             dia_semana_creacion,
+             mes_modificacion,
+             dia_semana_modificacion,
+             threshold = 0.01,
+             other = "otro") %>% 
+  step_tokenize(c(name,nombre_fichero)) %>% 
+  step_stopwords(c(name, nombre_fichero),language = "es") %>% 
+  step_tokenfilter(c(name,nombre_fichero)) %>% 
+  step_tfidf(c(name,nombre_fichero))
+
+  prep(receta_no) %>% 
+    bake(new_data = NULL) %>% 
+    ggplot(aes(tipo)) +
+    geom_bar()
+
+```
+
+
+## Paso 4: Definir el flujo
+
+### Con random forest
+```{r flujo, eval = FALSE}
+flujo <- workflow() %>% 
+  add_model(rf_spec) %>% 
+  add_recipe(receta_no)
+```
+
+
+
+### Con XGboost
+
+```{r, eval = TRUE}
+flujo <- workflow() %>% 
+  add_model(xgb_spec) %>% 
+  add_recipe(receta_dummy)
+```
+
+## Paso 5: Ajustar el modelo
+
+Este es el paso más intensivo computacionalmente
+```{r, eval = FALSE}
+tic()
+modelo_rs <- fit_resamples(
+  flujo,
+  pliegos,
+  control = control_resamples(save_pred = TRUE, verbose = TRUE)
+  #metrics = metric_set(accuracy, sensitivity, specificity)
+)
+toc()
+
+```
+
+En el caso de xgboost, usamos `tune()`:
+
+```{r, eval = TRUE}
+registerDoParallel(cores = all_cores - 2)
+tic()
+set.seed(234)
+xgb_res <- tune_grid(
+  flujo,
+  resamples = pliegos,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE, verbose = TRUE)
+)
+toc()
+```
+
+
+## Paso 6: Evaluar el modelo
+
+```{r evaluar entrenamiento, eval = FALSE}
+metricas <- collect_metrics(modelo_rs)
+predicciones <- collect_predictions(modelo_rs)
+metricas
+
+```
+
+Si usamos xgboost:
+```{r, eval = TRUE}
+metricas <- collect_metrics(xgb_res)
+```
+
+### Graficar curvas ROC
+
+Se produce un error que por lo pronto no logro identificar
+```{r curvas roc, error = TRUE}
+predicciones %>%
+  group_by(id) %>%
+  roc_curve(truth = tipo, .pred_110:.pred_otros,na_rm = TRUE) %>%
+  autoplot() +
+  labs(
+    color = NULL,
+    title = "ROC para meta_ubicación",
+    subtitle = "Cada pliego un color diferente"
+  )
+```
+
+### Matrices de confusión
+
+```{r confusion fold1}
+predicciones %>% 
+  filter(id == "Fold01") %>%
+  conf_mat(tipo, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+### Comparación con el modelo nulo
+
+Las metricas obtenidas deben ser superiores a las del modelo nulo para que tenga
+sentido la modelización
+```{r}
+null_classification <- null_model() %>%
+  set_engine("parsnip") %>%
+  set_mode("classification")
+
+null_rs <- workflow() %>%
+  add_recipe(receta) %>%
+  add_model(null_classification) %>%
+  fit_resamples(
+    pliegos
+  )
+
+null_rs %>%
+  collect_metrics()
+```
+
+### Comparación con el conjunto de prueba
+
+El modelo ajustado se mide con los datos de prueba:
+```{r evaluacion prueba}
+final_rf <- flujo %>% 
+  last_fit(split = division)
+
+```
+
+
+y se obtienen las metricas y predicciones respectivas:
+```{r metricas prueba}
+final_res_metrics <- collect_metrics(final_rf)
+final_res_predictions <- collect_predictions(final_rf)
+correlacion_matthews <- mcc(final_res_predictions,truth = tipo, estimate = .pred_class)
+final_res_metrics <- bind_rows(final_res_metrics, correlacion_matthews)
+
+```
+
+### Importancia de variables
+
+
+```{r}
+final_rf %>% 
+  pluck(".workflow", 1) %>%   
+  pull_workflow_fit() %>% 
+  vip(num_features = 15)
+```
+
+### Matriz de confusión final
+
+```{r}
+final_res_predictions %>%
+  conf_mat(truth = tipo, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+## Paso 7: Guardar el modelo para pasos futuros
+
+Potencialmente, se guarda el modelo como un objeto binario para ser usado por los 
+meta clasificadores de la arquitectura
+```{r, eval = FALSE}
+mejor <- flujo %>% 
+  fit(data = entrenamiento)
+saveRDS(mejor, file = "modelo_metadata.rds")
+
+```
+
+
+# Próximos pasos:
+
+ - Estudiar el efecto de la reclasificación en los resultados
+ - Definir cuales son las mejores métricas para evaluar el modelo
+ - Ver que mejoras se pueden obtener usando xgboost
+ 

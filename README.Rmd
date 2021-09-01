@@ -1,0 +1,67 @@
+---
+output: github_document
+---
+# Clasificación automática de Documentos 
+## Ruta del Cacao ##
+
+### Ejemplo ejecución del modelo de metadatos
+
+Este es un ejemplo de como correrían los modelos automáticos de clasificación
+con el propósito de tener una prueba que permita ir definiendo como se
+acoplarían estos resultados con el resto de la arquitectura del sistema **ICONOS**
+
+ (@) Es necesario el archivo Excel de los metadatos correspondientes (`RDC_2019_V1.xlsx`) 
+que debe estar almacenados en una sub-carpeta `\datos` en el directorio de trabajo
+
+ (@) Si el modelo se esta ejecutando bajo Windows, es necesario instalar [Rtools](https://cran.r-project.org/bin/windows/Rtools/).
+
+ (@) En este proyecto en el contexto de desarrollo usamos `renv` para guardar la lista
+de librerías o paquetes que son necesarios para ejecutar el modelo. Para reestablecer
+el ambiente necesario use `renv::restore()`: 
+
+```{bash, eval = FALSE}
+Rscript -e 'renv::restore()'
+```
+
+
+
+#### Obtener el binario del modelo:
+
+La **primera vez que se ejecuta**, es necesario producir el binario del modelo. Para
+eso, hay que correr en la terminal:
+
+```{bash, eval = FALSE}
+
+Rscript solo_modelo_metadatos.R
+
+```
+
+Si no hay ningún problema, al culminar debe haber una archivo: `modelo_metadata.rds`
+que es el archivo con el binario del modelo.
+
+#### Obtener una muestra
+
+Como un substituto de nuevos datos con los cuales alimentar el modelo, el script 
+`generar_datos.R` produce una muestra aleatoria de n números del archivo
+Excel y los guarda en un archivo de nombre `muestra.csv` para obtener fácilmente
+datos de prueba para ejecutar el modelo. Por ejemplo, si se quiere obtener
+10 documentos para probar el algoritmo se escribiría en la terminal: 
+
+```{bash, eval=FALSE}
+Rscript generar_datos.R 10
+```
+
+#### Ejecución del modelo
+
+Para poder ejecutar este ejemplo se ejecuta `modelo_servido.R`: un script en R 
+que recibe un .csv con datos de entrada de metadatos de RDC (en este ejemplo, 
+`muestra.csv`) y produce como salida un .csv con los datos clasificados (en este 
+ejemplo, `resultado.csv`). Para ejecutarlo se escribe en la terminal (o se hace
+una llamada al sistema en el lenguaje de programación en donde se este ejecutando)
+
+```{bash, eval=FALSE}
+Rscript modelo_servido.R muestra.csv resultado.csv
+```
+
+
+
